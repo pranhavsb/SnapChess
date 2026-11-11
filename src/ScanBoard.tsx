@@ -21,9 +21,20 @@ import {
 } from "./scanner/flattenBoard";
 import {
   classifySquares,
+  getModelInfo,
   type BoardClassification,
   type SquarePrediction,
 } from "./scanner/classifyBoard";
+import {
+  CAMERA_SIDES,
+  TALL_CROP_EXTENSION,
+  cameraSideFromRotation,
+  cameraSideLabel,
+  cropGeometryTag,
+  tallCropFlatRects,
+  tallCrops,
+} from "./scanner/tallCrops";
+import type { CameraSide } from "./scanner/tallPieces";
 import {
   buildFen,
   validateEditorPosition,
@@ -93,6 +104,8 @@ type BoardSession = {
   tallCrops: Map<string, ImageData>;
   tightCrops: Map<string, ImageData>;
   cropGeometry: string;
+  cropExtension: number;
+  cameraSide: CameraSide;
   cornerPoints: CornerPoints;
   uploaded: Set<string>;
 };
@@ -114,17 +127,9 @@ function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   });
 }
 
-function tightSquareCrops(canvas: HTMLCanvasElement): Map<string, ImageData> {
-  const ctx = canvas.getContext("2d");
-  const out = new Map<string, ImageData>();
-  if (!ctx) return out;
-  SQUARES_A8_H1.forEach((square, i) => {
-    const x = BOARD_MARGIN + (i % 8) * SQUARE_SIZE;
-    const y = BOARD_MARGIN + Math.floor(i / 8) * SQUARE_SIZE;
-    out.set(square, ctx.getImageData(x, y, SQUARE_SIZE, SQUARE_SIZE));
-  });
-  return out;
-}
+const DEBUG_VIEW =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).get("debug") === "1";
 
 function fenLoadError(fen: string): string | null {
   try {
@@ -315,7 +320,7 @@ export function ScanBoard({
         tight_crop_path: tightPath,
         full_board_image_path: boardPath,
         corner_points: session.cornerPoints,
-        camera_side: null,
+        camera_side: session.cameraSide,
         crop_geometry: session.cropGeometry,
         camera_angle_estimate: null,
         board_style_tag: null,
@@ -699,22 +704,43 @@ export function ScanBoard({
       ctx.stroke();
     }
 
+    const session = boardSessionRef.current;
+    if (DEBUG_VIEW && session) {
+      const side = session.cameraSide;
+      const ext = session.cropExtension;
+      ctx.lineWidth = 1;
+      for (const { tall, base } of tallCropFlatRects(side, ext)) {
+        ctx.strokeStyle = "#6B665A";
+        ctx.strokeRect(tall.x + 0.5, tall.y + 0.5, tall.w - 1, tall.h - 1);
+        ctx.strokeStyle = "#151515";
+        ctx.strokeRect(base.x + 3.5, base.y + 3.5, base.w - 7, base.h - 7);
+      }
+    }
+
     ctx.restore();
   }
 
   async function runClassification(
     extracted: SquareCrop[],
     boardId: string,
+    cameraSide: CameraSide,
   ): Promise<void> {
     setIsClassifying(true);
     setClassifyProgress(0);
     try {
-      const result = await classifySquares(extracted, (done) => {
-        setClassifyProgress(done);
-      });
+      const result = await classifySquares(
+        extracted,
+        (done) => {
+          setClassifyProgress(done);
+        },
+        { cameraSide },
+      );
       if (boardSessionRef.current?.boardId !== boardId) return;
       setClassification(result);
-      const check = new Set(result.uncertainSquares);
+      const check = new Set([
+        ...result.uncertainSquares,
+        ...result.tallCheckSquares,
+      ]);
       setLabels((prev) => {
         const next = { ...prev };
         for (const p of result.squares) {
@@ -760,7 +786,13 @@ export function ScanBoard({
         rawCanvas,
       );
 
-      const extracted = cropSquares(rawCanvas);
+      const cameraSide = cameraSideFromRotation(nextRotationSteps);
+      const info = await getModelInfo();
+      const extension =
+        info.cropMode === "tall" ? info.cropExtension : TALL_CROP_EXTENSION;
+      const legacy = cropSquares(rawCanvas);
+      const tall = tallCrops(rawCanvas, cameraSide, extension);
+      const extracted = info.cropMode === "tall" ? tall.tall : legacy;
       const boardCanvas = document.createElement("canvas");
       boardCanvas.width = rawCanvas.width;
       boardCanvas.height = rawCanvas.height;
@@ -769,9 +801,12 @@ export function ScanBoard({
       boardSessionRef.current = {
         boardId,
         boardCanvas,
-        tallCrops: new Map(extracted.map((c) => [c.square, c.image])),
-        tightCrops: tightSquareCrops(rawCanvas),
-        cropGeometry: "legacy",
+        tallCrops: new Map(tall.tall.map((c) => [c.square, c.image])),
+        tightCrops: new Map(tall.tight.map((c) => [c.square, c.image])),
+        // Describes the uploaded crop_image_path files, which are always tall.
+        cropGeometry: cropGeometryTag(extension),
+        cropExtension: extension,
+        cameraSide,
         cornerPoints: {
           corners: corners.map((pt) => ({ x: pt.x, y: pt.y })),
           rotationSteps90: nextRotationSteps,
@@ -794,7 +829,7 @@ export function ScanBoard({
         }
       });
 
-      void runClassification(extracted, boardId);
+      void runClassification(extracted, boardId, cameraSide);
     } catch (err) {
       const msg =
         err instanceof Error ? err.message : "Could not flatten board image.";
@@ -948,10 +983,12 @@ export function ScanBoard({
                       data-state={label.state}
                       data-selected={selectedSquare === square ? "true" : undefined}
                       aria-label={`${square}${valueWords} ${STATE_WORDS[label.state]}`}
-                      onPointerEnter={(e) =>
-                        e.currentTarget.focus({ preventScroll: true })
-                      }
+                      onPointerEnter={(e) => {
+                        e.currentTarget.focus({ preventScroll: true });
+                        handleSquareFocus(square);
+                      }}
                       onFocus={() => handleSquareFocus(square)}
+                      onClick={() => handleSquareFocus(square)}
                       onKeyDown={(e) => handleSquareKeyDown(e, index)}
                     >
                       {text ? <span className="label-piece">{text}</span> : null}
@@ -966,7 +1003,8 @@ export function ScanBoard({
                 aria-label="Extracted squares"
               >
                 <span className="field-label">
-                  Extracted 64 squares (100x150px each)
+                  Extracted 64 squares ({crops[0].image.width}x
+                  {crops[0].image.height}px each, as sent to the model)
                 </span>
                 <div className="crops-grid" data-testid="crops-grid">
                   {crops.map((crop, idx) => (
@@ -1008,6 +1046,19 @@ export function ScanBoard({
               Corners ({corners.length} of 4): 1 top-left, 2 top-right, 3
               bottom-right, 4 bottom-left
             </span>
+            <span className="field-label">Camera on</span>
+            <div className="choice-row">
+              {CAMERA_SIDES.map(({ side, steps, label }) => (
+                <button
+                  key={side}
+                  type="button"
+                  aria-pressed={rotationSteps90 === steps}
+                  onClick={() => setRotationSteps90(steps)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
             <div className="controls-stack">
               <button
                 type="button"
@@ -1020,7 +1071,7 @@ export function ScanBoard({
                 <button
                   type="button"
                   disabled={isFlattening}
-                  onClick={() => void runFlatten(0)}
+                  onClick={() => void runFlatten(rotationSteps90)}
                 >
                   {isFlattening ? "Flattening" : "Flatten"}
                 </button>
@@ -1204,6 +1255,9 @@ export function ScanBoard({
             <div className="editor-section" aria-label="Flattened board actions">
               <span className="field-label">
                 Verify grid alignment and orient so a1 is bottom-left
+              </span>
+              <span className="field-label" data-testid="camera-side">
+                Camera: {cameraSideLabel(cameraSideFromRotation(rotationSteps90))}
               </span>
               <div className="controls-stack">
                 <button

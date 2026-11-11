@@ -2,6 +2,7 @@ import * as ort from "onnxruntime-web/wasm";
 import ortWasmUrl from "onnxruntime-web/ort-wasm-simd-threaded.wasm?url";
 import type { SquareCrop } from "./cropSquares";
 import { decodePlacement, priorFromCounts, type PositionPrior } from "./pieceRules";
+import { resolveTallConflicts, type CameraSide } from "./tallPieces";
 
 export const MODEL_CLASSES = [
   "empty",
@@ -42,6 +43,11 @@ export type BoardClassification = {
   /** Raw softmax rows (a8..h1), 13 probabilities each in MODEL_CLASSES order. */
   probabilities: number[][];
   modelVersion: string;
+  cropMode: CropMode;
+  /** Squares behind a tall piece that may hold a ghost of it; shown for checking. */
+  tallCheckSquares: string[];
+  /** Ghost pieces removed by the tall-piece rules (also in tallCheckSquares). */
+  droppedSquares: string[];
 };
 
 export type CropMode = "legacy" | "tall";
@@ -147,6 +153,7 @@ function cropImageDataToTensor(
   srcCanvas: HTMLCanvasElement,
   srcCtx: CanvasRenderingContext2D,
   dstCtx: CanvasRenderingContext2D,
+  mode: CropMode,
 ): ort.Tensor {
   if (srcCanvas.width !== crop.width || srcCanvas.height !== crop.height) {
     srcCanvas.width = crop.width;
@@ -154,18 +161,40 @@ function cropImageDataToTensor(
   }
   srcCtx.putImageData(crop, 0, 0);
 
-  dstCtx.clearRect(0, 0, INPUT_W, INPUT_H);
-  dstCtx.drawImage(
-    srcCanvas,
-    0,
-    0,
-    crop.width,
-    crop.height,
-    0,
-    0,
-    INPUT_W,
-    INPUT_H,
-  );
+  if (mode === "tall") {
+    // Letterbox: keep the aspect ratio, centre the crop, pad with black.
+    // Training must pad the same way.
+    const scale = Math.min(INPUT_W / crop.width, INPUT_H / crop.height);
+    const w = Math.round(crop.width * scale);
+    const h = Math.round(crop.height * scale);
+    dstCtx.fillStyle = "#000";
+    dstCtx.fillRect(0, 0, INPUT_W, INPUT_H);
+    dstCtx.drawImage(
+      srcCanvas,
+      0,
+      0,
+      crop.width,
+      crop.height,
+      Math.floor((INPUT_W - w) / 2),
+      Math.floor((INPUT_H - h) / 2),
+      w,
+      h,
+    );
+  } else {
+    // Legacy model: the 100x150 crop is stretched straight to the input size.
+    dstCtx.clearRect(0, 0, INPUT_W, INPUT_H);
+    dstCtx.drawImage(
+      srcCanvas,
+      0,
+      0,
+      crop.width,
+      crop.height,
+      0,
+      0,
+      INPUT_W,
+      INPUT_H,
+    );
+  }
 
   const { data } = dstCtx.getImageData(0, 0, INPUT_W, INPUT_H);
   const planeSize = INPUT_H * INPUT_W;
@@ -212,9 +241,14 @@ export function predictionsToPlacement(
   return rankStrings.join("/");
 }
 
+/**
+ * Crops must be ordered a8..h1 and cut the way getModelInfo().cropMode says.
+ * cameraSide enables the tall-piece rules (ghost pieces behind kings, queens and bishops).
+ */
 export async function classifySquares(
   crops: SquareCrop[],
   onProgress?: (done: number, total: number) => void,
+  options: { cameraSide?: CameraSide } = {},
 ): Promise<BoardClassification> {
   if (crops.length !== 64) {
     throw new Error(`Expected 64 square crops, got ${crops.length}.`);
@@ -249,6 +283,7 @@ export async function classifySquares(
       srcCanvas,
       srcCtx,
       dstCtx,
+      info.cropMode,
     );
     const outputs = await session.run({ input: inputTensor });
     const logits = outputs.logits.data as Float32Array;
@@ -269,7 +304,15 @@ export async function classifySquares(
     .map((crop) => crop.square);
   const unfamiliarBoard = uncertainSquares.length > UNFAMILIAR_LIMIT;
   const usedPrior = unfamiliarBoard ? null : prior;
-  const decoded = decodePlacement(rows, usedPrior, !unfamiliarBoard);
+  let decoded: PredictedSymbol[] = decodePlacement(rows, usedPrior, !unfamiliarBoard);
+  let tallCheckSquares: string[] = [];
+  let droppedSquares: string[] = [];
+  if (options.cameraSide) {
+    const tall = resolveTallConflicts(decoded, rows, options.cameraSide);
+    decoded = tall.symbols as PredictedSymbol[];
+    tallCheckSquares = tall.checkSquares;
+    droppedSquares = tall.dropped;
+  }
   const squares: SquarePrediction[] = decoded.map((symbol, i) => ({
     square: crops[i].square,
     symbol,
@@ -294,5 +337,8 @@ export async function classifySquares(
     unfamiliarBoard,
     probabilities: rows,
     modelVersion: info.modelVersion,
+    cropMode: info.cropMode,
+    tallCheckSquares,
+    droppedSquares,
   };
 }

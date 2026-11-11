@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test src/positionEditor.test.ts src/scanner/pieceRules.test.ts",
+    "test": "node --experimental-strip-types --test src/positionEditor.test.ts src/scanner/pieceRules.test.ts src/scanner/tallPieces.test.ts",
     "build:prior": "node --experimental-strip-types scripts/buildPositionPrior.ts",
     "export:training": "node --experimental-strip-types scripts/export_training_set.ts"
   },
