@@ -1293,10 +1293,12 @@ export function ScanBoard({
                 />
                 <span>Share corrections</span>
               </label>
-              <button type="button" onClick={handleSaveForTraining}>
-                Save for training
-              </button>
-              {savedNotice ? (
+              {DEBUG_VIEW ? (
+                <button type="button" onClick={handleSaveForTraining}>
+                  Save for training
+                </button>
+              ) : null}
+              {DEBUG_VIEW && savedNotice ? (
                 <p className="status-line">{savedNotice}</p>
               ) : null}
             </div>
