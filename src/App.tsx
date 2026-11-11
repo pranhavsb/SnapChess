@@ -87,6 +87,9 @@ export function App() {
     <main className="page">
       <header className="masthead">
         <h1>Snapchess</h1>
+        <a className="masthead-about" href="/about">
+          About
+        </a>
       </header>
 
       {screen === "editor" ? (
