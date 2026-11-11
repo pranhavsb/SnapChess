@@ -1,3 +1,4 @@
+import openCvUrl from "@techstark/opencv-js/dist/opencv.js?url";
 import { BOARD_MARGIN, FLATTENED_SIZE } from "./cropSquares";
 
 export type Point2D = {
@@ -8,37 +9,59 @@ export type Point2D = {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type CvInstance = any;
 
-let cvPromise: Promise<CvInstance> | null = null;
+// OpenCV is loaded as a classic <script>, not through import(). Bundling its UMD
+// file makes the production build wrap the exported promise in an object that
+// inherits from Promise without being one, and awaiting that throws
+// "Promise.prototype.then called on incompatible receiver". The ready module is
+// also kept inside a { cv } box because it can be thenable itself.
+type CvBox = { cv: CvInstance };
 
-export function loadOpenCv(): Promise<CvInstance> {
+let cvPromise: Promise<CvBox> | null = null;
+
+function isReady(value: unknown): boolean {
+  return Boolean(value) && typeof (value as Record<string, unknown>).Mat === "function";
+}
+
+function injectScript(src: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = src;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => {
+      script.remove();
+      reject(new Error("Could not load the image tools. Check your connection and try again."));
+    };
+    document.head.appendChild(script);
+  });
+}
+
+export function loadOpenCv(): Promise<CvBox> {
   if (cvPromise) return cvPromise;
 
-  cvPromise = (async () => {
-    const mod = await import("@techstark/opencv-js");
-    const raw = (mod as { default?: unknown }).default ?? mod;
+  cvPromise = (async (): Promise<CvBox> => {
+    const scope = globalThis as unknown as { cv?: CvInstance };
+    if (!scope.cv) await injectScript(openCvUrl);
+    const loaded = scope.cv;
+    if (!loaded) throw new Error("The image tools did not start.");
 
-    if (raw instanceof Promise) {
-      return await raw;
+    if (isReady(loaded)) return { cv: loaded };
+    if (typeof loaded.then === "function") {
+      return await new Promise<CvBox>((resolve, reject) => {
+        loaded.then((cv: CvInstance) => {
+          scope.cv = cv;
+          resolve({ cv });
+        }, reject);
+      });
     }
-
-    const candidate = raw as Record<string, unknown>;
-    if (typeof candidate.Mat === "function") {
-      return candidate;
-    }
-
-    if (
-      candidate.cv &&
-      typeof (candidate.cv as Record<string, unknown>).Mat === "function"
-    ) {
-      return candidate.cv;
-    }
-
-    return await new Promise<CvInstance>((resolve) => {
-      candidate.onRuntimeInitialized = () => {
-        resolve((candidate.cv as CvInstance) ?? candidate);
-      };
+    return await new Promise<CvBox>((resolve) => {
+      loaded.onRuntimeInitialized = () => resolve({ cv: loaded });
     });
   })();
+
+  cvPromise.catch(() => {
+    cvPromise = null;
+  });
 
   return cvPromise;
 }
@@ -60,7 +83,7 @@ export async function flattenBoardToCanvas(
   rotationSteps90 = 0,
   targetCanvas?: HTMLCanvasElement,
 ): Promise<HTMLCanvasElement> {
-  const cv = await loadOpenCv();
+  const { cv } = await loadOpenCv();
 
   let ordered: [Point2D, Point2D, Point2D, Point2D] = [
     corners[0],
