@@ -1,0 +1,80 @@
+{
+  "model_file": "snapchess_pieces.onnx",
+  "model_file_fp32": "snapchess_pieces_fp32.onnx",
+  "quantization": "int8 weights (per-channel symmetric, DequantizeLinear) + fp16 depthwise weights (Cast); fp32 activations",
+  "input_name": "input",
+  "input_shape": [
+    1,
+    3,
+    144,
+    96
+  ],
+  "input_layout": "NCHW",
+  "input_dtype": "float32",
+  "output_name": "logits",
+  "output_shape": [
+    1,
+    13
+  ],
+  "output_note": "raw logits; apply softmax for probabilities",
+  "classes": [
+    "empty",
+    "P",
+    "N",
+    "B",
+    "R",
+    "Q",
+    "K",
+    "p",
+    "n",
+    "b",
+    "r",
+    "q",
+    "k"
+  ],
+  "class_note": "index -> FEN symbol, uppercase = white, 'empty' = no piece",
+  "board_warp": {
+    "warp_size": 1000,
+    "board_margin": 100,
+    "square_size": 100,
+    "corner_order": "a8 -> top-left, h8 -> top-right, h1 -> bottom-right, a1 -> bottom-left (White at the bottom)",
+    "source_image_max_side": 1500
+  },
+  "crop": {
+    "width": 100,
+    "height": 150,
+    "extra_top": 50,
+    "formula": "for square (file f=0..7 a..h, row r=0..7 rank 8..1): x = 100 + 100*f, y = 100 + 100*r - 50, crop [x, x+100) x [y, y+150)"
+  },
+  "preprocessing": {
+    "resize": {
+      "width": 96,
+      "height": 144,
+      "interpolation": "bilinear",
+      "note": "resize the 100x150 crop straight to 96x144 (no aspect-ratio padding)"
+    },
+    "color_order": "RGB",
+    "scale": "divide uint8 values by 255.0",
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "formula": "x[c] = (pixel[c] / 255 - mean[c]) / std[c]"
+  },
+  "checkpoint": {
+    "epoch": 1,
+    "val_acc": 0.9790360501567398
+  },
+  "onnx_test_accuracy": {
+    "fp32": 0.9815665849673203,
+    "final": 0.9813623366013072,
+    "n_crops": 19584
+  },
+  "opset": 17
+}

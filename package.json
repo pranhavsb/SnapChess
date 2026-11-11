@@ -1,0 +1,31 @@
+{
+  "name": "snapchess",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "node --experimental-strip-types --test src/positionEditor.test.ts src/scanner/pieceRules.test.ts",
+    "build:prior": "node --experimental-strip-types scripts/buildPositionPrior.ts"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "fzstd": "^0.1.1",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.6"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.119.0",
+    "@techstark/opencv-js": "^5.0.0-release.1",
+    "chess.js": "^1.4.0",
+    "onnxruntime-web": "^1.31.1",
+    "react": "^19.3.1",
+    "react-chessboard": "^5.12.1",
+    "react-dom": "^19.3.1",
+    "stockfish": "^19.0.1"
+  }
+}
