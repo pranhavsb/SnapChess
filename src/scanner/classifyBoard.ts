@@ -39,7 +39,56 @@ export type BoardClassification = {
   uncertainSquares: string[];
   /** Too many uncertain squares: the model has probably never seen this board or set. */
   unfamiliarBoard: boolean;
+  /** Raw softmax rows (a8..h1), 13 probabilities each in MODEL_CLASSES order. */
+  probabilities: number[][];
+  modelVersion: string;
 };
+
+export type CropMode = "legacy" | "tall";
+
+export type ModelInfo = {
+  modelVersion: string;
+  cropMode: CropMode;
+  cropExtension: number;
+};
+
+const MODEL_INFO_URL = "/models/model_info.json";
+const DEFAULT_MODEL_INFO: ModelInfo = {
+  modelVersion: "unversioned",
+  cropMode: "legacy",
+  cropExtension: 1.2,
+};
+
+let modelInfoPromise: Promise<ModelInfo> | null = null;
+
+/** Crop mode travels with the model: a model trained on tall crops must be fed tall crops. */
+export function getModelInfo(): Promise<ModelInfo> {
+  if (modelInfoPromise) return modelInfoPromise;
+  modelInfoPromise = (async () => {
+    try {
+      const response = await fetch(MODEL_INFO_URL);
+      if (!response.ok) return DEFAULT_MODEL_INFO;
+      const data = (await response.json()) as {
+        model_version?: unknown;
+        crop?: { mode?: unknown; extension?: unknown };
+      };
+      return {
+        modelVersion:
+          typeof data.model_version === "string" && data.model_version
+            ? data.model_version
+            : DEFAULT_MODEL_INFO.modelVersion,
+        cropMode: data.crop?.mode === "tall" ? "tall" : "legacy",
+        cropExtension:
+          typeof data.crop?.extension === "number"
+            ? data.crop.extension
+            : DEFAULT_MODEL_INFO.cropExtension,
+      };
+    } catch {
+      return DEFAULT_MODEL_INFO;
+    }
+  })();
+  return modelInfoPromise;
+}
 
 const UNSURE_PROBABILITY = 0.6;
 // Past this many unsure squares, game statistics would mostly be inventing the
@@ -171,9 +220,10 @@ export async function classifySquares(
     throw new Error(`Expected 64 square crops, got ${crops.length}.`);
   }
 
-  const [session, prior] = await Promise.all([
+  const [session, prior, info] = await Promise.all([
     getClassifierSession(),
     getPositionPrior(),
+    getModelInfo(),
   ]);
 
   const srcCanvas = document.createElement("canvas");
@@ -242,5 +292,7 @@ export async function classifySquares(
     usedPositionPrior: usedPrior !== null,
     uncertainSquares,
     unfamiliarBoard,
+    probabilities: rows,
+    modelVersion: info.modelVersion,
   };
 }

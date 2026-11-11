@@ -2,9 +2,12 @@ import {
   useEffect,
   useRef,
   useState,
+  useSyncExternalStore,
   type ChangeEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { Chess } from "chess.js";
 import {
   BOARD_MARGIN,
   cropSquares,
@@ -21,14 +24,116 @@ import {
   type BoardClassification,
   type SquarePrediction,
 } from "./scanner/classifyBoard";
-import { STARTING_FEN, validateFenString } from "./fenValidator";
+import {
+  buildFen,
+  validateEditorPosition,
+  type CastlingRights,
+} from "./fenValidator";
 import { saveForTraining } from "./scanner/trainingExport";
+import {
+  SQUARES_A8_H1,
+  emptyLabels,
+  inferCastling,
+  labelsToBoard,
+  startingValues,
+  symbolToValue,
+  valueColour,
+  valuePiece,
+  type LabelState,
+  type Labels,
+  type SquareValue,
+} from "./scanner/labels";
+import {
+  enqueue,
+  getShareConsent,
+  getSyncStatus,
+  isSharing,
+  setShareConsent,
+  subscribeSyncStatus,
+  type CornerPoints,
+  type QueueItem,
+  type ScanLabelRow,
+} from "./scanner/labelSync";
 
 const MIN_IMAGE_DIMENSION = 200;
 const MAGNIFIER_SIZE = 120;
 const MAGNIFIER_ZOOM = 2.5;
 
 type ScanStep = "corners" | "flattened";
+
+const PIECE_KEYS: Record<string, string> = {
+  k: "K",
+  q: "Q",
+  r: "R",
+  b: "B",
+  n: "N",
+  p: "P",
+};
+
+const PICKER_PIECES = [
+  ["K", "King"],
+  ["Q", "Queen"],
+  ["R", "Rook"],
+  ["B", "Bishop"],
+  ["N", "Knight"],
+  ["P", "Pawn"],
+] as const;
+
+const STATE_WORDS: Record<LabelState, string> = {
+  unset: "not set",
+  guessed: "guess",
+  check: "check",
+  confirmed: "confirmed",
+};
+
+/** Everything uploaded with the labels of one flattened board. */
+type BoardSession = {
+  boardId: string;
+  boardCanvas: HTMLCanvasElement;
+  tallCrops: Map<string, ImageData>;
+  tightCrops: Map<string, ImageData>;
+  cropGeometry: string;
+  cornerPoints: CornerPoints;
+  uploaded: Set<string>;
+};
+
+function imageDataToBlob(image: ImageData): Promise<Blob> {
+  const canvas = document.createElement("canvas");
+  canvas.width = image.width;
+  canvas.height = image.height;
+  canvas.getContext("2d")?.putImageData(image, 0, 0);
+  return canvasToBlob(canvas);
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("Could not encode image."));
+    }, "image/png");
+  });
+}
+
+function tightSquareCrops(canvas: HTMLCanvasElement): Map<string, ImageData> {
+  const ctx = canvas.getContext("2d");
+  const out = new Map<string, ImageData>();
+  if (!ctx) return out;
+  SQUARES_A8_H1.forEach((square, i) => {
+    const x = BOARD_MARGIN + (i % 8) * SQUARE_SIZE;
+    const y = BOARD_MARGIN + Math.floor(i / 8) * SQUARE_SIZE;
+    out.set(square, ctx.getImageData(x, y, SQUARE_SIZE, SQUARE_SIZE));
+  });
+  return out;
+}
+
+function fenLoadError(fen: string): string | null {
+  try {
+    new Chess(fen);
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : "This position cannot be loaded.";
+  }
+}
 
 type ScanBoardProps = {
   onBackHome: () => void;
@@ -104,9 +209,222 @@ export function ScanBoard({
   const [rotationSteps90, setRotationSteps90] = useState<number>(0);
   const [showSquares, setShowSquares] = useState<boolean>(false);
   const [crops, setCrops] = useState<SquareCrop[]>([]);
-  const [trainingFen, setTrainingFen] = useState<string>("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
+
+  const [labels, setLabels] = useState<Labels>(emptyLabels);
+  const [selectedSquare, setSelectedSquare] = useState<string | null>(null);
+  const [pendingColour, setPendingColour] = useState<"w" | "b" | null>(null);
+  const [turn, setTurn] = useState<"w" | "b">("w");
+  const [castlingOverride, setCastlingOverride] =
+    useState<CastlingRights | null>(null);
+  const [sharing, setSharing] = useState<boolean>(getShareConsent);
+  const syncStatus = useSyncExternalStore(subscribeSyncStatus, getSyncStatus);
+  const boardSessionRef = useRef<BoardSession | null>(null);
+  const squareButtonRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
+  const labelBoard = labelsToBoard(labels);
+  const castling = castlingOverride ?? inferCastling(labelBoard);
+  const liveFen = buildFen(labelBoard, { turn, castling });
+  const positionWarning = validateEditorPosition(labelBoard, {
+    turn,
+    castling,
+  }).error;
+  const loadError = fenLoadError(liveFen);
+  const selectedValue = selectedSquare ? labels[selectedSquare].value : null;
+  const pickerColour: "w" | "b" | null =
+    pendingColour ??
+    (selectedValue && selectedValue !== "empty"
+      ? (selectedValue[0] as "w" | "b")
+      : null);
+  const confirmedCount = SQUARES_A8_H1.filter(
+    (sq) => labels[sq].state === "confirmed",
+  ).length;
+
+  function resetLabelling(): void {
+    setLabels(emptyLabels());
+    setSelectedSquare(null);
+    setPendingColour(null);
+    setTurn("w");
+    setCastlingOverride(null);
+  }
+
+  function modelGuessFor(square: string): SquarePrediction | undefined {
+    return classification?.squares.find((p) => p.square === square);
+  }
+
+  async function buildQueueItems(
+    updates: [string, SquareValue][],
+  ): Promise<QueueItem[]> {
+    const session = boardSessionRef.current;
+    if (!session || !isSharing()) return [];
+    const items: QueueItem[] = [];
+    const boardPath = `${session.boardId}/board.png`;
+    if (!session.uploaded.has("board")) {
+      session.uploaded.add("board");
+      items.push({
+        kind: "file",
+        path: boardPath,
+        blob: await canvasToBlob(session.boardCanvas),
+        contentType: "image/png",
+      });
+    }
+    const rows: QueueItem[] = [];
+    for (const [square, value] of updates) {
+      const tallPath = `${session.boardId}/${square}.png`;
+      const tightPath = `${session.boardId}/${square}_tight.png`;
+      if (!session.uploaded.has(square)) {
+        session.uploaded.add(square);
+        const tall = session.tallCrops.get(square);
+        const tight = session.tightCrops.get(square);
+        if (tall) {
+          items.push({
+            kind: "file",
+            path: tallPath,
+            blob: await imageDataToBlob(tall),
+            contentType: "image/png",
+          });
+        }
+        if (tight) {
+          items.push({
+            kind: "file",
+            path: tightPath,
+            blob: await imageDataToBlob(tight),
+            contentType: "image/png",
+          });
+        }
+      }
+      const guess = modelGuessFor(square);
+      const guessValue = guess ? symbolToValue(guess.symbol) : null;
+      const row: ScanLabelRow = {
+        id: crypto.randomUUID(),
+        board_id: session.boardId,
+        square,
+        colour: valueColour(value),
+        piece: valuePiece(value),
+        source:
+          guessValue === null
+            ? "user_manual"
+            : guessValue === value
+              ? "model_guess_confirmed"
+              : "user_corrected",
+        model_guess: guess ? guess.symbol : null,
+        model_version: classification?.modelVersion ?? "unversioned",
+        model_confidence: guess ? guess.confidence : null,
+        crop_image_path: tallPath,
+        tight_crop_path: tightPath,
+        full_board_image_path: boardPath,
+        corner_points: session.cornerPoints,
+        camera_side: null,
+        crop_geometry: session.cropGeometry,
+        camera_angle_estimate: null,
+        board_style_tag: null,
+      };
+      rows.push({ kind: "row", row });
+    }
+    return [...items, ...rows];
+  }
+
+  function confirmSquares(updates: [string, SquareValue][]): void {
+    if (updates.length === 0) return;
+    setLabels((prev) => {
+      const next = { ...prev };
+      for (const [square, value] of updates) {
+        next[square] = { value, state: "confirmed" };
+      }
+      return next;
+    });
+    void buildQueueItems(updates)
+      .then((items) => enqueue(items))
+      .catch((err) => console.warn("Could not queue scan labels.", err));
+  }
+
+  function chooseValue(square: string, value: SquareValue): void {
+    setPendingColour(null);
+    confirmSquares([[square, value]]);
+  }
+
+  function handleConfirmAll(): void {
+    const updates: [string, SquareValue][] = [];
+    for (const square of SQUARES_A8_H1) {
+      const label = labels[square];
+      if (label.state === "confirmed") continue;
+      updates.push([square, label.value ?? "empty"]);
+    }
+    confirmSquares(updates);
+  }
+
+  function handleFillStart(): void {
+    const start = startingValues();
+    setLabels((prev) => {
+      const next = { ...prev };
+      for (const square of SQUARES_A8_H1) {
+        if (next[square].state === "confirmed") continue;
+        next[square] = { value: start[square], state: "guessed" };
+      }
+      return next;
+    });
+  }
+
+  function handleToggleCastling(key: keyof CastlingRights): void {
+    setCastlingOverride({ ...castling, [key]: !castling[key] });
+  }
+
+  function handleToggleSharing(): void {
+    const next = !sharing;
+    setShareConsent(next);
+    setSharing(next);
+  }
+
+  function focusSquare(index: number): void {
+    squareButtonRefs.current[index]?.focus({ preventScroll: true });
+  }
+
+  function handleSquareKeyDown(
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ): void {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    const square = SQUARES_A8_H1[index];
+    const row = Math.floor(index / 8);
+    const col = index % 8;
+    const moves: Record<string, [number, number]> = {
+      ArrowUp: [-1, 0],
+      ArrowDown: [1, 0],
+      ArrowLeft: [0, -1],
+      ArrowRight: [0, 1],
+    };
+    const move = moves[event.key];
+    if (move) {
+      event.preventDefault();
+      const nr = Math.min(7, Math.max(0, row + move[0]));
+      const nc = Math.min(7, Math.max(0, col + move[1]));
+      focusSquare(nr * 8 + nc);
+      return;
+    }
+    const key = event.key.toLowerCase();
+    if (event.key === "Escape") {
+      setPendingColour(null);
+      return;
+    }
+    if (pendingColour && PIECE_KEYS[key]) {
+      event.preventDefault();
+      chooseValue(square, `${pendingColour}${PIECE_KEYS[key]}` as SquareValue);
+      return;
+    }
+    if (key === "w" || key === "b") {
+      event.preventDefault();
+      setPendingColour(key);
+    } else if (key === "e") {
+      event.preventDefault();
+      chooseValue(square, "empty");
+    }
+  }
+
+  function handleSquareFocus(square: string): void {
+    if (square !== selectedSquare) setPendingColour(null);
+    setSelectedSquare(square);
+  }
 
   function loadImageElement(
     img: HTMLImageElement,
@@ -147,6 +465,8 @@ export function ScanBoard({
     setClassification(null);
     setErrorMessage(null);
     setSavedNotice(null);
+    boardSessionRef.current = null;
+    resetLabelling();
   }
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -350,8 +670,6 @@ export function ScanBoard({
   function drawGridOverlay(
     rawCanvas: HTMLCanvasElement,
     outCanvas: HTMLCanvasElement,
-    preds?: SquarePrediction[] | null,
-    uncertain?: string[] | null,
   ): void {
     outCanvas.width = FLATTENED_SIZE;
     outCanvas.height = FLATTENED_SIZE;
@@ -381,49 +699,33 @@ export function ScanBoard({
       ctx.stroke();
     }
 
-    if (preds && preds.length === 64) {
-      ctx.font = '600 22px "IBM Plex Mono", "Courier New", monospace';
-      ctx.textBaseline = "bottom";
-      const unsure = new Set(uncertain ?? []);
-      for (let i = 0; i < 64; i += 1) {
-        const p = preds[i];
-        if (!p) continue;
-        const row = Math.floor(i / 8);
-        const col = i % 8;
-        if (unsure.has(p.square)) {
-          const qx = start + (col + 1) * SQUARE_SIZE - 25;
-          const qy = start + row * SQUARE_SIZE + 28;
-          ctx.fillStyle = "#F2EEE3";
-          ctx.fillRect(qx - 3, qy - 24, 22, 24);
-          ctx.strokeStyle = "#151515";
-          ctx.strokeRect(qx - 3, qy - 24, 22, 24);
-          ctx.fillStyle = "#151515";
-          ctx.fillText("?", qx + 2, qy);
-        }
-        if (p.symbol === "empty") continue;
-        const x = start + col * SQUARE_SIZE + 6;
-        const y = start + (row + 1) * SQUARE_SIZE - 4;
-        ctx.fillStyle = "rgba(242, 238, 227, 0.88)";
-        ctx.fillRect(x - 3, y - 24, 22, 24);
-        ctx.strokeStyle = "#151515";
-        ctx.strokeRect(x - 3, y - 24, 22, 24);
-        ctx.fillStyle = "#B3261E";
-        ctx.fillText(p.symbol, x, y);
-      }
-    }
-
     ctx.restore();
   }
 
-  async function runClassification(extracted: SquareCrop[]): Promise<void> {
+  async function runClassification(
+    extracted: SquareCrop[],
+    boardId: string,
+  ): Promise<void> {
     setIsClassifying(true);
     setClassifyProgress(0);
     try {
       const result = await classifySquares(extracted, (done) => {
         setClassifyProgress(done);
       });
+      if (boardSessionRef.current?.boardId !== boardId) return;
       setClassification(result);
-      setTrainingFen(result.fen);
+      const check = new Set(result.uncertainSquares);
+      setLabels((prev) => {
+        const next = { ...prev };
+        for (const p of result.squares) {
+          if (next[p.square]?.state !== "unset") continue;
+          next[p.square] = {
+            value: symbolToValue(p.symbol),
+            state: check.has(p.square) ? "check" : "guessed",
+          };
+        }
+        return next;
+      });
     } catch (err) {
       const msg =
         err instanceof Error ? err.message : "Could not classify board squares.";
@@ -459,6 +761,26 @@ export function ScanBoard({
       );
 
       const extracted = cropSquares(rawCanvas);
+      const boardCanvas = document.createElement("canvas");
+      boardCanvas.width = rawCanvas.width;
+      boardCanvas.height = rawCanvas.height;
+      boardCanvas.getContext("2d")?.drawImage(rawCanvas, 0, 0);
+      const boardId = crypto.randomUUID();
+      boardSessionRef.current = {
+        boardId,
+        boardCanvas,
+        tallCrops: new Map(extracted.map((c) => [c.square, c.image])),
+        tightCrops: tightSquareCrops(rawCanvas),
+        cropGeometry: "legacy",
+        cornerPoints: {
+          corners: corners.map((pt) => ({ x: pt.x, y: pt.y })),
+          rotationSteps90: nextRotationSteps,
+          imageWidth: imageDimensions?.width ?? 0,
+          imageHeight: imageDimensions?.height ?? 0,
+        },
+        uploaded: new Set(),
+      };
+      resetLabelling();
       setCrops(extracted);
       setStep("flattened");
       setRotationSteps90(nextRotationSteps);
@@ -468,12 +790,11 @@ export function ScanBoard({
           drawGridOverlay(
             rawFlattenedCanvasRef.current,
             flattenedCanvasRef.current,
-            null,
           );
         }
       });
 
-      void runClassification(extracted);
+      void runClassification(extracted, boardId);
     } catch (err) {
       const msg =
         err instanceof Error ? err.message : "Could not flatten board image.";
@@ -492,8 +813,6 @@ export function ScanBoard({
       drawGridOverlay(
         rawFlattenedCanvasRef.current,
         flattenedCanvasRef.current,
-        classification?.squares ?? null,
-        classification?.uncertainSquares ?? null,
       );
     }
   }, [step, rotationSteps90, classification]);
@@ -512,7 +831,7 @@ export function ScanBoard({
       imageHeight: imageDimensions.height,
       corners: [corners[0], corners[1], corners[2], corners[3]],
       rotationSteps90,
-      fen: trainingFen,
+      fen: liveFen,
     });
     setSavedNotice(`Saved ${baseName}.${photoExt} and ${baseName}.json`);
   }
@@ -597,11 +916,50 @@ export function ScanBoard({
           </div>
         ) : (
           <div className="flattened-container">
-            <canvas
-              ref={flattenedCanvasRef}
-              className="flattened-canvas"
-              data-testid="flattened-canvas"
-            />
+            <div className="label-board">
+              <canvas
+                ref={flattenedCanvasRef}
+                className="flattened-canvas"
+                data-testid="flattened-canvas"
+              />
+              <div
+                className="label-grid"
+                aria-label="Squares, a8 to h1"
+                data-testid="label-grid"
+              >
+                {SQUARES_A8_H1.map((square, index) => {
+                  const label = labels[square];
+                  const text =
+                    label.value && label.value !== "empty" ? label.value : "";
+                  const valueWords =
+                    label.value === null
+                      ? ""
+                      : label.value === "empty"
+                        ? " empty,"
+                        : ` ${label.value},`;
+                  return (
+                    <button
+                      key={square}
+                      type="button"
+                      ref={(el) => {
+                        squareButtonRefs.current[index] = el;
+                      }}
+                      className="label-square"
+                      data-state={label.state}
+                      data-selected={selectedSquare === square ? "true" : undefined}
+                      aria-label={`${square}${valueWords} ${STATE_WORDS[label.state]}`}
+                      onPointerEnter={(e) =>
+                        e.currentTarget.focus({ preventScroll: true })
+                      }
+                      onFocus={() => handleSquareFocus(square)}
+                      onKeyDown={(e) => handleSquareKeyDown(e, index)}
+                    >
+                      {text ? <span className="label-piece">{text}</span> : null}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
             {showSquares && crops.length === 64 ? (
               <div
                 className="crops-debug-section"
@@ -681,41 +1039,166 @@ export function ScanBoard({
                     ? `Detected position (${Math.round(classification.meanConfidence * 100)}% avg confidence${classification.adjustedSquares > 0 ? `, ${classification.adjustedSquares} squares corrected by piece counts${classification.usedPositionPrior ? " and game statistics" : ""}` : ""})`
                     : "Piece recognition"}
               </span>
-              {classification ? (
-                <>
-                  <code className="fen-output" data-testid="scanned-fen-output">
-                    {classification.fen}
-                  </code>
-                  {classification.unfamiliarBoard ? (
-                    <p className="status-line">
-                      This board looks unfamiliar to the model:{" "}
-                      {classification.uncertainSquares.length} squares are
-                      uncertain (marked ?), so no guesses were filled in. Save a
-                      few labelled photos of this set below to teach the next
-                      model.
-                    </p>
-                  ) : null}
-                  <div className="controls-stack">
-                    {onOpenInEditor ? (
-                      <button
-                        type="button"
-                        onClick={() => onOpenInEditor(classification.fen)}
-                      >
-                        Review & edit position
-                      </button>
-                    ) : null}
-                    {onPlayFromHere &&
-                    validateFenString(classification.fen).valid ? (
-                      <button
-                        type="button"
-                        onClick={() => onPlayFromHere(classification.fen)}
-                      >
-                        Play from here
-                      </button>
-                    ) : null}
-                  </div>
-                </>
+              {classification?.unfamiliarBoard ? (
+                <p className="status-line">
+                  This board looks unfamiliar to the model:{" "}
+                  {classification.uncertainSquares.length} squares are
+                  uncertain and marked for checking. Labelling this board
+                  teaches the next model.
+                </p>
               ) : null}
+            </div>
+
+            <div className="editor-section" aria-label="Label squares">
+              <span className="field-label">
+                {selectedSquare
+                  ? `Square ${selectedSquare}: ${labels[selectedSquare].value ?? "not set"}, ${STATE_WORDS[labels[selectedSquare].state]}`
+                  : "Select a square on the board"}
+              </span>
+              <div className="choice-row">
+                <button
+                  type="button"
+                  disabled={!selectedSquare}
+                  aria-pressed={
+                    selectedSquare !== null &&
+                    labels[selectedSquare].value === "empty"
+                  }
+                  onClick={() =>
+                    selectedSquare && chooseValue(selectedSquare, "empty")
+                  }
+                >
+                  Empty
+                </button>
+                <button
+                  type="button"
+                  disabled={!selectedSquare}
+                  aria-pressed={pickerColour === "w"}
+                  onClick={() => setPendingColour("w")}
+                >
+                  White
+                </button>
+                <button
+                  type="button"
+                  disabled={!selectedSquare}
+                  aria-pressed={pickerColour === "b"}
+                  onClick={() => setPendingColour("b")}
+                >
+                  Black
+                </button>
+              </div>
+              <div className="choice-row">
+                {PICKER_PIECES.map(([letter, name]) => (
+                  <button
+                    key={letter}
+                    type="button"
+                    disabled={!selectedSquare || !pickerColour}
+                    aria-pressed={
+                      selectedSquare !== null &&
+                      pickerColour !== null &&
+                      labels[selectedSquare].value === `${pickerColour}${letter}`
+                    }
+                    onClick={() =>
+                      selectedSquare &&
+                      pickerColour &&
+                      chooseValue(
+                        selectedSquare,
+                        `${pickerColour}${letter}` as SquareValue,
+                      )
+                    }
+                  >
+                    {name}
+                  </button>
+                ))}
+              </div>
+              <p className="label-help">
+                Point at a square, then press w or b followed by k q r b n p, or
+                e for empty. Arrow keys move between squares. Dashed squares
+                need a check.
+              </p>
+              <p className="label-counter" data-testid="label-counter">
+                {confirmedCount} / 64 confirmed
+                {syncStatus ? (
+                  <span className="label-sync"> {syncStatus}</span>
+                ) : null}
+              </p>
+              <div className="controls-stack">
+                <button
+                  type="button"
+                  disabled={confirmedCount === 64}
+                  onClick={handleConfirmAll}
+                >
+                  Confirm all
+                </button>
+                <button type="button" onClick={handleFillStart}>
+                  Fill starting position
+                </button>
+              </div>
+            </div>
+
+            <div className="editor-section" aria-label="Start the game">
+              <span className="field-label">Position</span>
+              <code className="fen-output" data-testid="scanned-fen-output">
+                {liveFen}
+              </code>
+              <span className="field-label">Side to move</span>
+              <div className="choice-row">
+                <button
+                  type="button"
+                  aria-pressed={turn === "w"}
+                  onClick={() => setTurn("w")}
+                >
+                  White
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={turn === "b"}
+                  onClick={() => setTurn("b")}
+                >
+                  Black
+                </button>
+              </div>
+              <span className="field-label">Castling</span>
+              <div className="controls-stack">
+                {(
+                  [
+                    ["wK", "White kingside"],
+                    ["wQ", "White queenside"],
+                    ["bK", "Black kingside"],
+                    ["bQ", "Black queenside"],
+                  ] as const
+                ).map(([key, text]) => (
+                  <label key={key} className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={castling[key]}
+                      onChange={() => handleToggleCastling(key)}
+                    />
+                    <span>{text}</span>
+                  </label>
+                ))}
+              </div>
+              {positionWarning && !loadError ? (
+                <p className="status-line">{positionWarning}</p>
+              ) : null}
+              {loadError ? (
+                <p className="status-line">Cannot start yet: {loadError}</p>
+              ) : null}
+              <div className="controls-stack">
+                {onPlayFromHere ? (
+                  <button
+                    type="button"
+                    disabled={loadError !== null}
+                    onClick={() => onPlayFromHere(liveFen)}
+                  >
+                    Start the game
+                  </button>
+                ) : null}
+                {onOpenInEditor ? (
+                  <button type="button" onClick={() => onOpenInEditor(liveFen)}>
+                    Review & edit position
+                  </button>
+                ) : null}
+              </div>
             </div>
 
             <div className="editor-section" aria-label="Flattened board actions">
@@ -743,33 +1226,19 @@ export function ScanBoard({
               </div>
             </div>
 
-            <div className="editor-section" aria-label="Training data export">
-              <label className="field-label" htmlFor="training-fen-input">
-                FEN for training (optional)
+            <div className="editor-section" aria-label="Training data">
+              <p className="label-help">
+                Your corrections help train the scanner. Each confirmed square is
+                saved with its photo crop.
+              </p>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={sharing}
+                  onChange={handleToggleSharing}
+                />
+                <span>Share corrections</span>
               </label>
-              <input
-                id="training-fen-input"
-                type="text"
-                value={trainingFen}
-                onChange={(e) => setTrainingFen(e.target.value)}
-                placeholder="Type FEN for this photo"
-              />
-              <div className="controls-stack">
-                <button
-                  type="button"
-                  onClick={() => setTrainingFen(STARTING_FEN)}
-                >
-                  Starting position
-                </button>
-                {classification ? (
-                  <button
-                    type="button"
-                    onClick={() => setTrainingFen(classification.fen)}
-                  >
-                    Use detected position
-                  </button>
-                ) : null}
-              </div>
               <button type="button" onClick={handleSaveForTraining}>
                 Save for training
               </button>

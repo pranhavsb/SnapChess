@@ -1,4 +1,5 @@
 {
+  "model_version": "v1-chessred",
   "model_file": "snapchess_pieces.onnx",
   "model_file_fp32": "snapchess_pieces_fp32.onnx",
   "quantization": "int8 weights (per-channel symmetric, DequantizeLinear) + fp16 depthwise weights (Cast); fp32 activations",

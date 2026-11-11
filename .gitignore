@@ -34,3 +34,6 @@ supabase/.branches
 
 # Personal training photos (upload via the app instead)
 manual-training/
+
+# Exported training set (npm run export:training)
+dataset/
